@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS tide_revisions (
 CREATE TABLE IF NOT EXISTS tide_values (
     revision INTEGER NOT NULL REFERENCES tide_revisions(revision),
     minute   INTEGER NOT NULL,
-    level    REAL NOT NULL,                                 -- 潮位（米）
+    level    REAL NOT NULL,                             -- 名义潮位（米）
+    error    REAL NOT NULL DEFAULT 0.0,                 -- 预测误差（米，非负）：真值落在 level±error
     PRIMARY KEY (revision, minute)
 );
 
@@ -78,8 +79,16 @@ def get_conn():
 def init_db(conn: sqlite3.Connection) -> None:
     """建表；空库且 SEED_DEMO 时写入演示数据。幂等。"""
     conn.executescript(SCHEMA)
+    _migrate(conn)
     if config.SEED_DEMO and conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 0:
         _seed_demo(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """旧版数据库平滑升级：为 tide_values 补 error 列（既有行误差取 0）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(tide_values)").fetchall()}
+    if "error" not in cols:
+        conn.execute("ALTER TABLE tide_values ADD COLUMN error REAL NOT NULL DEFAULT 0.0")
 
 
 # ---------------------------------------------------------------------------
