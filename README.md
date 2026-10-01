@@ -3,12 +3,15 @@
 基于 **Python + FastAPI + SQLite** 的潮汐窗口航路规划服务。录入港口节点、单向航段
 （正整数分钟航时、静水深度、可选桥底净空）与逐分钟潮位后，给定船舶吃水、水面以上
 高度、安全余量及不超过 1440 分钟的规划窗口，计算**最早抵达**行程；同一抵达时刻按
-**航段编号序列字典序**择优。潮位以**修订号**版本化管理，确认行程时在同一数据库事务
-中复核修订号与行程，过期即冲突且不保存，已确认行程作为不可变快照长期保留。潮位更正
-后，调度员可凭**已确认行程号 + 目标潮位修订号**复核原航路：按快照原占用分钟逐段校验
-水深与桥高；原行程不安全时，在保持航段编号顺序、船舶参数、原起始分钟与规划窗口不变、
-仅允许节点重新等待的前提下求**改期行程**（变动航段最少 → 抵达最早 → 出发分钟序列
-字典序），窗口内无解则只返回风险与无解标记，**绝不修改已确认快照**。
+**航段编号序列字典序**择优。潮位以**修订号**版本化管理，每个修订的逐分钟数据为
+**名义潮位 + 非负预测误差（米）**：既支持更正名义潮位，也支持调度员仅修订逐分钟
+误差。确认行程时在同一数据库事务中复核修订号与行程，过期即冲突且不保存，已确认
+行程作为不可变快照长期保留。目标修订下（名义潮位更正或误差修订后），调度员可凭
+**已确认行程号 + 目标潮位修订号**复核原航路：按快照原占用分钟逐段按**误差带**
+（水深看低潮位、净空看高潮位）校验；原行程不安全时，在保持航段编号顺序、船舶参数、
+原起始分钟与规划窗口不变、仅允许节点重新等待的前提下求**改期行程**（变动航段最少 →
+抵达最早 → 出发分钟序列字典序），窗口内无解则只返回风险与无解标记，**绝不修改
+已确认快照**。
 
 ---
 
@@ -78,36 +81,50 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **节点**：港口位置点。**航段为单向**，航时必须为**正整数**分钟；可设桥底净空（不设表示无桥）。
 - **时间轴**：绝对"分钟"（非负整数），与潮位表的 `minute` 对齐。规划窗口为
   `[start_minute, start_minute + window_minutes)`，长度 ≤ 1440。
-- **等待**：船可在任一节点的任意整分钟等待（等待不占用水深/净空资源）。
+- **等待**：船可在任一节点的任意整分钟等待（等待不占用水深/净空资源，**不校验**潮位）。
 - **航段占用**：于整分钟 `d` 进入、航时 `t`，则占用 `d, d+1, …, d+t-1` 共 `t` 分钟，
-  于 `d+t` 抵达。占用的**每一分钟**都必须同时满足：
-  - 水深：`静水深度 + 潮位 ≥ 吃水 + 安全余量`
-  - 桥高（仅当该航段有桥）：`桥底净空 − 潮位 ≥ 水面以上高度 + 安全余量`
+  于 `d+t` 抵达。占用的**每一分钟**都按该修订该分钟的**名义潮位 `level` 与非负预测
+  误差 `error`（米）**的误差带极值核验，同时满足：
+  - 水深（按低潮位核验）：`静水深度 + 名义潮位 − 误差 ≥ 吃水 + 安全余量`
+  - 桥高（仅当该航段有桥，按高潮位核验）：`桥底净空 − 名义潮位 − 误差 ≥ 水面以上高度 + 安全余量`
 - **择优**：到达分钟最小；同一到达分钟，按航段编号（`seg_id`，自增）组成的序列做
   字典序比较，序列小者优先（先比较首段编号，相同再比较下一段）。
-- **潮位修订**：修订号自增、内容不可变。"更正"以某修订为基础全量继承、仅覆盖给定分钟，
-  生成一个**新修订**，旧修订永久保留。
-- **规划**：默认使用**最新**修订，也可显式指定修订号。窗口内任何一分钟缺少潮位即报错。
+- **潮位修订**：修订号自增、内容不可变。每个修订逐分钟保存名义潮位与非负误差；
+  历史库中的**旧修订一律视为误差 0**。两种派生方式：
+  - **名义潮位更正**（`POST /api/tide/corrections`）：以某修订为基础**名义潮位与
+    误差全量继承**，仅覆盖给定分钟的名义潮位（被覆盖分钟的误差随确定性更正归零，
+    未改分钟名义潮位与误差均不变），生成一个**新修订**；
+  - **逐分钟误差修订**（`POST /api/tide/error-revisions`）：调度员基于**指定或最新**
+    修订，提交 `{非负整分钟: 非负误差}`；**未列出的分钟继承所据修订误差，名义潮位
+    保持不变**（旧修订的分钟误差即 0），返回**新修订号**，修订不可变。
+- **规划**：默认使用**最新**修订，也可显式指定修订号。窗口内任何一分钟缺少名义潮位
+  即报错。
 - **确认**：请求必须携带规划所据 `revision`。服务在单个 SQLite 事务（`BEGIN IMMEDIATE`）中：
   1. 检查该修订是否仍为最新——否则 `409 REVISION_STALE`，**不保存**；
-  2. 依据该修订与请求参数**重新计算**并与提交的行程逐段比对——不一致则
-     `409 PLAN_MISMATCH`，**不保存**；
+  2. 依据该修订（含逐分钟误差带）与请求参数**重新计算**并与提交的行程逐段比对——
+     不一致则 `409 PLAN_MISMATCH`，**不保存**；
   3. 复核通过后保存**当时的结果快照**（修订号、参数、到达分钟、完整行程 JSON）。
-     之后再发生潮位更正不影响已确认行程。
+     之后再发生名义潮位更正或误差修订均不影响已确认行程。
 - **更正后复核 / 改期**（只读，不改写快照）：携带已确认行程号与目标修订号，
   1. **原航路复核**：按快照中的航段编号顺序与原占用分钟（进入分钟 `d` 占用
-     `d..d+t-1`），依目标修订的逐分钟潮位逐段校验；首分钟违规即判定原行程不安全，
-     返回首次违规的航段（`leg_index`/`seg_id`）、分钟及原因（`depth` 水深不足 /
-     `clearance` 桥高净空不足），并给出该分钟实际/要求的水深与净空；
+     `d..d+t-1`），依目标修订的逐分钟**名义潮位与误差带**逐段校验（水深
+     `静水深度+名义−误差`、净空 `桥底净空−名义−误差`）；首分钟违规即判定原行程
+     不安全，返回首次违规的航段（`leg_index`/`seg_id`）、分钟及原因（`depth`
+     水深不足 / `clearance` 桥高净空不足），并给出该分钟名义潮位（`tide_level`）、
+     误差（`tide_error`）与**按对应极值计算**的实际/要求水深与净空；
   2. **改期**：不安全时启用。**保持**原航段编号顺序、船舶参数（吃水/水面以上
      高度/余量）、原起始分钟与规划窗口（窗口内占用才合法），**仅允许在节点重新
-     等待**——即各段首尾相接、只调整每段出发分钟。择优依次为：
+     等待**——即各段首尾相接、只调整每段出发分钟。改期占用分钟同样按误差带核验、
+     等待不校验。择优依次为：
      ① 相对快照**出发分钟变动的航段个数**（`changed_leg_count`）最少；
      ② **抵达分钟最早**；③ 前述均相同，按各段出发分钟序列做字典序（小者优先）；
   3. 原行程安全时直接返回 `safe=true`（零航段行程恒安全，无需改期）；窗口内无
      改期解时返回原行程风险加 `no_solution=true`，此时仍可在 `/api/trips` 读到
-     原封不动的快照。缺潮位、未知行程、未知修订沿用 `MISSING_TIDE_DATA` /
+     原封不动的快照。缺名义潮位、未知行程、未知修订沿用 `MISSING_TIDE_DATA` /
      `TRIP_NOT_FOUND` / `TIDE_REVISION_NOT_FOUND` 既有错误语义。
+- **误差修订的入参报错**：基础修订不存在 → `404 TIDE_REVISION_NOT_FOUND`；
+  误差为负（或分钟为负）→ `422 VALIDATION_ERROR`；目标分钟在所据修订缺少名义
+  潮位 → `422 MISSING_TIDE_DATA`（不产生新修订）。
 
 ### 错误响应格式
 
@@ -120,9 +137,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 起点或终点未知 | 404 | `NODE_NOT_FOUND` |
 | 指定潮位修订不存在 / 复核时目标修订未知 | 404 | `TIDE_REVISION_NOT_FOUND` |
 | 复核时行程号未知 | 404 | `TRIP_NOT_FOUND` |
-| 窗口内有分钟缺潮位 | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
+| 窗口内有分钟缺名义潮位（含误差修订目标分钟缺名义潮位） | 422 | `MISSING_TIDE_DATA`（`details` 给出缺失分钟列表与数量） |
 | 窗口内无可行行程 | 404 | `NO_FEASIBLE_ITINERARY` |
-| 参数校验失败（窗口>1440、航时非正等） | 422 | `VALIDATION_ERROR` |
+| 参数校验失败（窗口>1440、航时非正、误差为负等） | 422 | `VALIDATION_ERROR` |
 | 确认时修订已过期 | 409 | `REVISION_STALE` |
 | 确认时行程复核不一致 | 409 | `PLAN_MISMATCH` |
 
@@ -137,8 +154,9 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/segments` | 录入单向航段 |
 | GET | `/api/segments` | 航段列表（按编号排序） |
 | GET | `/api/tide/revisions` | 潮位修订列表 |
-| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟潮位 |
-| POST | `/api/tide/corrections` | 潮位更正，生成新修订 |
+| GET | `/api/tide/revisions/{rev}?from_minute=&to_minute=` | 取某修订逐分钟名义潮位与误差（`levels` / `errors`） |
+| POST | `/api/tide/corrections` | 名义潮位更正，生成新修订（继承误差，被覆盖分钟误差归零） |
+| POST | `/api/tide/error-revisions` | 逐分钟误差修订（非负分钟→非负误差），名义潮位不变，生成新修订 |
 | POST | `/api/trips/plan` | 规划最早抵达行程 |
 | POST | `/api/trips/confirm` | 携带修订号确认行程（事务复核） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
@@ -207,6 +225,32 @@ POST /api/trips/confirm
 成功返回 `201`，响应为含 `trip_id / revision / arrival_minute / itinerary / confirmed_at`
 的不可变快照；过期返回 `409 REVISION_STALE`。
 
+### 逐分钟误差修订请求 / 响应示例
+
+潮位预测存在逐分钟误差时，调度员基于**指定或最新**修订提交 `{非负整分钟: 非负误差}`；
+未列出的分钟继承所据修订误差，**名义潮位保持不变**，返回新修订号（修订不可变）：
+
+```json
+POST /api/tide/error-revisions
+{
+  "base_revision": 1,
+  "errors": {"100": 0.8, "101": 0.5},
+  "note": "预报偏差带修订（米）"
+}
+```
+
+```json
+{ "revision": 2, "note": "预报偏差带修订（米）", "created_at": "2026-10-01 07:05:43" }
+```
+
+- `base_revision` 可省略（取最新修订）；`errors` 的键为非负整分钟、值为**非负**
+  误差（米）。未知基础修订 → `404 TIDE_REVISION_NOT_FOUND`；负分钟/负误差 →
+  `422 VALIDATION_ERROR`；目标分钟在基础修订缺名义潮位 → `422 MISSING_TIDE_DATA`。
+- 取修订内容时，`GET /api/tide/revisions/{rev}` 同时返回 `levels`（名义潮位）与
+  `errors`（逐分钟误差）；旧修订与未修订分钟的误差均为 `0.0`。
+- 名义潮位更正（`/api/tide/corrections`）会**继承所据修订的逐分钟误差**，仅被覆盖
+  分钟的误差随该分钟名义潮位一并更正为 `0`；误差修订则**只动误差、不动名义潮位**。
+
 ### 更正后复核 / 改期请求与响应示例
 
 潮位发生更正后，凭**已确认行程号**与**目标潮位修订号**复核（`target_revision`
@@ -239,6 +283,7 @@ POST /api/trips/1/review
     "minute": 100,
     "reasons": ["depth"],
     "tide_level": 0.2,
+    "tide_error": 0.0,
     "depth": 4.0,
     "clearance": 8.0,
     "required_depth": 7.0,
@@ -271,7 +316,9 @@ POST /api/trips/1/review
 - 第一段出发分钟仍是快照中的 `54`（**变动航段数最少**优先）；第二、三段因需避开
   低潮而整体后移，`changed_leg_count=2`，改期抵达 161。
 - `first_violation` 按快照航段顺序、占用分钟递增给出**首次**违规；`reasons` 可能为
-  `["depth"]`、`["clearance"]` 或二者同时出现。
+  `["depth"]`、`["clearance"]` 或二者同时出现；`available_depth = 静水深度 +
+  tide_level − tide_error`、`available_clearance = 桥底净空 − tide_level −
+  tide_error`，即**按对应极值计算**（无桥时 `available_clearance` 为 `null`）。
 - **窗口内无改期解**：`reschedule=null` 且 `no_solution=true`，`first_violation`
   仍给出原行程风险；快照保持不变（`GET /api/trips/{trip_id}` 读到的仍是原内容）。
 - 该接口为**只读**：不新增、不修改任何确认行程，也不产生新修订。
@@ -304,6 +351,14 @@ curl -s -X POST $BASE/api/tide/corrections \
   -H 'Content-Type: application/json' \
   -d '{"corrections":{"100":0.2,"101":0.2},"note":"人工低潮更正"}'
 
+# 3b) 逐分钟误差修订：第 100、101 分钟误差 0.8m（名义潮位不变；base_revision 省略取最新）
+curl -s -X POST $BASE/api/tide/error-revisions \
+  -H 'Content-Type: application/json' \
+  -d '{"base_revision":2,"errors":{"100":0.8,"101":0.8},"note":"预报误差带"}'
+
+# 3c) 读取某修订的名义潮位 levels 与逐分钟误差 errors
+curl -s "$BASE/api/tide/revisions/3?from_minute=99&to_minute=101"
+
 # 4) 用旧修订号再次确认 -> 409 REVISION_STALE
 curl -i -X POST $BASE/api/trips/confirm \
   -H 'Content-Type: application/json' -d @/tmp/plan.json
@@ -333,6 +388,11 @@ print("已确认行程", tid, "第", trip["arrival_minute"], "分钟抵达")
 # 潮位更正：第 100 分钟异常低潮
 requests.post(f"{B}/api/tide/corrections", json={"corrections": {100: 0.2}})
 
+# 逐分钟误差修订：第 100、101 分钟预测误差 0.8m（名义潮位不变，未列分钟继承误差）
+rev = requests.post(f"{B}/api/tide/error-revisions",
+                    json={"errors": {100: 0.8, 101: 0.8}}).json()["revision"]
+print("新误差修订号", rev)
+
 # 复核原航路并取改期建议（只读，快照不变）
 rv = requests.post(f"{B}/api/trips/{tid}/review", json={}).json()
 if rv["safe"]:
@@ -361,9 +421,10 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 
 窗口不超过 1440 分钟，采用**时间展开动态规划**（实现见 `app/services/planning.py`）：
 
-1. 校验节点与修订；取窗口内全部潮位，缺任一分钟立即报 `MISSING_TIDE_DATA`；
-2. 对每条航段用"不可行分钟前缀和"预处理：任意进入分钟对应的占用区间是否全程满足
-   水深/净空，查询为 O(1)；
+1. 校验节点与修订；取窗口内全部名义潮位与逐分钟误差，缺任一分钟名义潮位立即报
+   `MISSING_TIDE_DATA`；
+2. 对每条航段用"不可行分钟前缀和"预处理：任意进入分钟对应的占用区间是否全程按
+   误差带满足水深（名义−误差）/净空（名义+误差），查询为 O(1)；
 3. 状态 `(节点, 分钟)` 只保留一个值：到达该状态的航段编号序列中**字典序最小**者。
    转移有两种：
    - 等待：同一节点序列不变推进到下一分钟；
@@ -377,10 +438,11 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 ### 更正后复核 / 改期（实现见 `app/services/reschedule.py`）
 
 1. 只读取出已确认快照（行程号、快照修订、船舶参数、原起始分钟/窗口、完整行程 JSON），
-   校验目标修订（缺省取最新；未知修订 `TIDE_REVISION_NOT_FOUND`），取全窗口潮位，
-   缺任一分钟报 `MISSING_TIDE_DATA`；未知行程报 `TRIP_NOT_FOUND`。
+   校验目标修订（缺省取最新；未知修订 `TIDE_REVISION_NOT_FOUND`），取全窗口名义潮位
+   与逐分钟误差，任一分钟缺名义潮位报 `MISSING_TIDE_DATA`；未知行程报 `TRIP_NOT_FOUND`。
 2. **原航路复核**：按快照航段顺序遍历每段原占用分钟（`d..d+t-1`），用与规划相同的
-   `_minute_ok` 判定，返回首个违规分钟及其 `depth`/`clearance` 原因。
+   `_minute_ok` 按误差带判定（水深 `深度+名义−误差`、净空 `净空−名义−误差`），
+   返回首个违规分钟及其 `depth`/`clearance` 原因，可用值按对应极值给出。
 3. **改期 DP**：航段序列固定（快照的 k 个 `seg_id`），状态为「完成前 i 段、于某分钟
    抵达该段终点」，每状态只保留一个最优代价
    `(相对快照的出发分钟变动段数, 各段出发分钟序列)`（字典序）。第 i 段用「抵达分钟
@@ -400,13 +462,13 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 ```
 app/
   config.py             # 环境变量配置
-  database.py           # SQLite 连接、建表、演示数据初始化
-  errors.py             # 统一业务错误（含 trip_not_found 构造器）
+  database.py           # SQLite 连接、建表（tide_values 含逐分钟 error 列）、旧库迁移、演示数据初始化
+  errors.py             # 统一业务错误（含 trip_not_found / 误差修订缺名义潮位构造器）
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
-  services/planning.py  # 潮汐约束与时间展开 DP 规划算法
-  services/reschedule.py# 更正后原行程复核与改期 DP（只读）
-  main.py               # FastAPI 路由（节点/航段/潮位/规划/确认/复核改期）
-tests/                  # pytest 测试（31 个，含择优、缺潮位、事务冲突、复核改期等）
+  services/planning.py  # 潮汐误差带约束（水深名义−误差/净空名义+误差）与时间展开 DP 规划算法
+  services/reschedule.py# 更正后按误差带复核原行程与改期 DP（只读）
+  main.py               # FastAPI 路由（节点/航段/潮位/名义更正/误差修订/规划/确认/复核改期）
+tests/                  # pytest 测试（47 个，含择优、缺潮位、事务冲突、复核改期、逐分钟误差带等）
 Dockerfile
 docker-compose.yml
 requirements.txt

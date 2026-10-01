@@ -1,14 +1,16 @@
-"""潮位更正后的原行程复核与改期。
+"""潮位更正（名义潮位 / 逐分钟误差）后的原行程复核与改期。
 
-输入为已确认行程快照（行程号 trip_id）与目标潮位修订号：
+输入为已确认行程快照（行程号 trip_id）与目标潮位修订号。每个修订的逐分钟
+数据为「名义潮位 level + 非负预测误差 error」：
 
 1. **原航路复核**：保持快照中的航段编号顺序与原占用分钟，逐段逐分钟按目标
-   修订的潮位校验水深与桥高，给出原行程是否安全；不安全时返回首次违规
-   （航段、分钟、水深/净空原因）。
+   修订的**误差带**校验——水深按低潮位（名义−误差）核验、桥高净空按高潮位
+   （名义+误差）核验；给出原行程是否安全，不安全时返回首次违规（航段、
+   分钟、水深/净空原因），并给出按对应极值计算的实际可用值。
 2. **改期**：保持原航段编号顺序、船舶参数、原起始分钟与规划窗口不变，仅允许
    在节点重新等待（即只调整各段出发分钟，且出发必须与前段抵达首尾相接）。
-   段一旦进入即连续占用 travel_time 分钟，窗口内占用的每一分钟均须满足
-   水深/净空约束。改期择优依次为：
+   段一旦进入即连续占用 travel_time 分钟，窗口内占用的每一分钟均须按上述
+   误差带满足水深/净空约束（等待不校验）。改期择优依次为：
      a. 相对快照，出发分钟发生变化的航段个数最少；
      b. 抵达分钟最早；
      c. 各段出发分钟序列字典序最小。
@@ -30,7 +32,7 @@ from typing import Optional
 
 from .. import config
 from ..errors import ApiError, tide_missing, trip_not_found
-from .planning import Segment, _build_departure_feasible, _load_segments
+from .planning import Segment, _build_departure_feasible, _load_segments, _load_tide
 
 
 def review_and_reschedule(
@@ -73,13 +75,8 @@ def review_and_reschedule(
         raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
                        f"潮位修订不存在: {revision}", {"revision": revision})
 
-    # 3) 全窗口潮位：任一分钟缺失即报错（与规划一致）
-    tide_rows = conn.execute(
-        "SELECT minute, level FROM tide_values"
-        " WHERE revision = ? AND minute BETWEEN ? AND ?",
-        (revision, start, horizon - 1),
-    ).fetchall()
-    tide = {r["minute"]: r["level"] for r in tide_rows}
+    # 3) 全窗口潮位（名义潮位 + 逐分钟误差）：名义潮位任一分钟缺失即报错（与规划一致）
+    tide = _load_tide(conn, revision, start, horizon - 1)
     missing = [m for m in range(start, horizon) if m not in tide]
     if missing:
         raise tide_missing(missing)
@@ -125,13 +122,14 @@ def review_and_reschedule(
 
 
 def _violation_reasons(
-    seg: Segment, level: float, draft, height, margin
+    seg: Segment, level: float, error: float, draft, height, margin
 ) -> list[str]:
+    """按误差带极值判定：水深看低潮位（名义−误差），净空看高潮位（名义+误差）。"""
     reasons = []
     eps = config.EPS
-    if seg.depth + level + eps < draft + margin:
+    if seg.depth + level - error + eps < draft + margin:
         reasons.append("depth")
-    if seg.clearance is not None and seg.clearance - level + eps < height + margin:
+    if seg.clearance is not None and seg.clearance - level - error + eps < height + margin:
         reasons.append("clearance")
     return reasons
 
@@ -142,8 +140,8 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
         seg = segs[leg["seg_id"]]
         d, t = leg["start_minute"], leg["travel_time"]
         for m in range(d, d + t):
-            level = tide.get(m)  # 全窗口已校验，缺失仅可能越出窗口（快照异常）
-            if level is None:
+            tv = tide.get(m)  # 全窗口已校验，缺失仅可能越出窗口（快照异常）
+            if tv is None:
                 return {
                     "leg_index": idx,
                     "seg_id": seg.seg_id,
@@ -152,6 +150,7 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
                     "minute": m,
                     "reasons": ["missing_tide"],
                     "tide_level": None,
+                    "tide_error": None,
                     "depth": seg.depth,
                     "clearance": seg.clearance,
                     "required_depth": draft + margin,
@@ -159,7 +158,8 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
                     "available_depth": None,
                     "available_clearance": None,
                 }
-            reasons = _violation_reasons(seg, level, draft, height, margin)
+            level, error = tv
+            reasons = _violation_reasons(seg, level, error, draft, height, margin)
             if reasons:
                 return {
                     "leg_index": idx,
@@ -169,13 +169,16 @@ def _check_original(legs, segs, tide, draft, height, margin) -> Optional[dict]:
                     "minute": m,
                     "reasons": reasons,
                     "tide_level": level,
+                    "tide_error": error,
                     "depth": seg.depth,
                     "clearance": seg.clearance,
                     "required_depth": draft + margin,
                     "required_clearance": height + margin,
-                    "available_depth": seg.depth + level,
+                    # 可用值按对应极值计算：水深用低潮位（名义−误差），净空用高潮位（名义+误差）
+                    "available_depth": seg.depth + level - error,
                     "available_clearance": (
-                        seg.clearance - level if seg.clearance is not None else None
+                        seg.clearance - level - error
+                        if seg.clearance is not None else None
                     ),
                 }
     return None

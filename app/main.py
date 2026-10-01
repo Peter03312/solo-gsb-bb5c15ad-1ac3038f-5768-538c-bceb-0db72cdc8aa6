@@ -9,8 +9,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import config
+from . import config
 from .database import get_conn, init_db
-from .errors import ApiError
+from .errors import ApiError, tide_missing_error_target
 from .schemas import (
     ConfirmRequest,
     NodeIn,
@@ -21,6 +22,7 @@ from .schemas import (
     SegmentIn,
     SegmentOut,
     TideCorrection,
+    TideErrorRevisionIn,
     TripOut,
     TripReviewOut,
 )
@@ -148,17 +150,25 @@ def get_revision(revision: int, from_minute: int = 0, to_minute: int = 1439):
             raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
                            f"潮位修订不存在: {revision}", {"revision": revision})
         rows = conn.execute(
-            "SELECT minute, level FROM tide_values"
+            "SELECT minute, level, error FROM tide_values"
             " WHERE revision = ? AND minute BETWEEN ? AND ? ORDER BY minute",
             (revision, from_minute, to_minute),
         ).fetchall()
-    return {"revision": revision, "from_minute": from_minute, "to_minute": to_minute,
-            "count": len(rows), "levels": {r["minute"]: r["level"] for r in rows}}
+    return {
+        "revision": revision,
+        "from_minute": from_minute,
+        "to_minute": to_minute,
+        "count": len(rows),
+        "levels": {r["minute"]: r["level"] for r in rows},
+        "errors": {r["minute"]: r["error"] for r in rows},
+    }
 
 
 @app.post("/api/tide/corrections", status_code=201, response_model=RevisionOut, tags=["tide"])
 def apply_correction(body: TideCorrection):
-    """潮位更正：基于某修订全量复制后覆盖给定分钟，生成新修订号。"""
+    """名义潮位更正：基于某修订全量复制（名义潮位与误差一并继承）后覆盖给定分钟
+    的名义潮位，被覆盖分钟的误差归零（视为对该分钟名义潮位的确定性更正），
+    生成新修订号。"""
     if not body.corrections:
         raise ApiError(422, "VALIDATION_ERROR", "corrections 不能为空")
     bad = [m for m in body.corrections if m < 0]
@@ -169,37 +179,24 @@ def apply_correction(body: TideCorrection):
     with get_conn() as conn:
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if body.base_revision is not None:
-                base = body.base_revision
-                if not conn.execute(
-                    "SELECT 1 FROM tide_revisions WHERE revision = ?", (base,)
-                ).fetchone():
-                    raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
-                                   f"基础修订不存在: {base}", {"revision": base})
-            else:
-                row = conn.execute(
-                    "SELECT revision FROM tide_revisions ORDER BY revision DESC LIMIT 1"
-                ).fetchone()
-                if row is None:
-                    raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
-                                   "系统中尚无任何潮位修订，首次修订必须直接录入")
-                base = row["revision"]
+            base = _resolve_base_revision(conn, body.base_revision)
 
             cur = conn.execute(
                 "INSERT INTO tide_revisions(note) VALUES (?)",
-                (body.note or f"基于修订 #{base} 的更正",),
+                (body.note or f"基于修订 #{base} 的名义潮位更正",),
             )
             new_rev = cur.lastrowid
 
-            # 全量继承所据修订
+            # 全量继承所据修订（名义潮位 + 逐分钟误差）
             conn.execute(
-                "INSERT INTO tide_values(revision, minute, level)"
-                " SELECT ?, minute, level FROM tide_values WHERE revision = ?",
+                "INSERT INTO tide_values(revision, minute, level, error)"
+                " SELECT ?, minute, level, error FROM tide_values WHERE revision = ?",
                 (new_rev, base),
             )
-            # 覆盖更正分钟
+            # 覆盖更正分钟的名义潮位；误差随名义潮位一并更正，归零
             conn.executemany(
-                "INSERT OR REPLACE INTO tide_values(revision, minute, level) VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO tide_values(revision, minute, level, error)"
+                " VALUES (?, ?, ?, 0)",
                 [(new_rev, m, lvl) for m, lvl in sorted(body.corrections.items())],
             )
             row = conn.execute(
@@ -214,6 +211,100 @@ def apply_correction(body: TideCorrection):
             conn.execute("ROLLBACK")
             raise
     return RevisionOut(**dict(row))
+
+
+@app.post(
+    "/api/tide/error-revisions",
+    status_code=201,
+    response_model=RevisionOut,
+    tags=["tide"],
+)
+def apply_error_revision(body: TideErrorRevisionIn):
+    """逐分钟误差修订：基于指定（或最新）修订，仅覆盖给定分钟的非负误差，
+    未列出的分钟继承所据修订误差，名义潮位保持不变；返回新修订号。
+
+    - 未知基础修订 -> 404 TIDE_REVISION_NOT_FOUND
+    - 负误差 / 负分钟 -> 422 VALIDATION_ERROR
+    - 目标分钟在基础修订缺名义潮位 -> 422 MISSING_TIDE_DATA
+    """
+    if not body.errors:
+        raise ApiError(422, "VALIDATION_ERROR", "errors 不能为空")
+    bad_minutes = [m for m in body.errors if m < 0]
+    if bad_minutes:
+        raise ApiError(422, "VALIDATION_ERROR", "分钟必须为非负整数",
+                       {"bad_minutes": bad_minutes})
+    negative = [
+        {"minute": m, "error": e}
+        for m, e in sorted(body.errors.items()) if e < -config.EPS
+    ]
+    if negative:
+        raise ApiError(422, "VALIDATION_ERROR", "误差必须为非负数（米）",
+                       {"negative_errors": negative})
+
+    with get_conn() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            base = _resolve_base_revision(conn, body.base_revision)
+
+            minutes = sorted(body.errors)
+            placeholders = ",".join("?" for _ in minutes)
+            existing = {
+                r["minute"] for r in conn.execute(
+                    f"SELECT minute FROM tide_values"
+                    f" WHERE revision = ? AND minute IN ({placeholders})",
+                    (base, *minutes),
+                ).fetchall()
+            }
+            absent = [m for m in minutes if m not in existing]
+            if absent:
+                raise tide_missing_error_target(absent, base)
+
+            cur = conn.execute(
+                "INSERT INTO tide_revisions(note) VALUES (?)",
+                (body.note or f"基于修订 #{base} 的逐分钟误差修订",),
+            )
+            new_rev = cur.lastrowid
+
+            # 名义潮位与误差全量继承；随后仅覆盖误差（名义潮位不变）
+            conn.execute(
+                "INSERT INTO tide_values(revision, minute, level, error)"
+                " SELECT ?, minute, level, error FROM tide_values WHERE revision = ?",
+                (new_rev, base),
+            )
+            conn.executemany(
+                "UPDATE tide_values SET error = ? WHERE revision = ? AND minute = ?",
+                [(max(0.0, float(e)), new_rev, m) for m, e in body.errors.items()],
+            )
+            row = conn.execute(
+                "SELECT revision, note, created_at FROM tide_revisions WHERE revision = ?",
+                (new_rev,),
+            ).fetchone()
+            conn.execute("COMMIT")
+        except ApiError:
+            conn.execute("ROLLBACK")
+            raise
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return RevisionOut(**dict(row))
+
+
+def _resolve_base_revision(conn, base: Optional[int]) -> int:
+    """解析基础修订号：显式指定则必须存在，否则取最新。"""
+    if base is not None:
+        if not conn.execute(
+            "SELECT 1 FROM tide_revisions WHERE revision = ?", (base,)
+        ).fetchone():
+            raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
+                           f"基础修订不存在: {base}", {"revision": base})
+        return base
+    row = conn.execute(
+        "SELECT revision FROM tide_revisions ORDER BY revision DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, "TIDE_REVISION_NOT_FOUND",
+                       "系统中尚无任何潮位修订，首次修订必须直接录入")
+    return row["revision"]
 
 
 # ---- 行程规划 / 确认 --------------------------------------------------------------

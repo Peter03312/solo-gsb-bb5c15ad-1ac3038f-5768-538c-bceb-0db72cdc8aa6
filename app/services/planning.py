@@ -4,9 +4,12 @@
 等待；航段一旦进入即连续占用 travel_time 个分钟（进入分钟 d 占用
 d, d+1, ..., d+t-1，于 d+t 抵达下一节点）。
 
-约束（占用的每一分钟均须满足）：
-  * 深度：静水深度 + 潮位 >= 吃水 + 安全余量
-  * 桥梁：桥底净空 - 潮位 >= 水面以上高度 + 安全余量（有桥时）
+每个修订的逐分钟数据为「名义潮位 level + 非负预测误差 error」。占用的
+每一分钟均须满足（等待不校验）：
+  * 深度（按误差带的低潮位核验）：
+        静水深度 + 名义潮位 − 误差 >= 吃水 + 安全余量
+  * 桥梁（按误差带的高潮位核验，有桥时）：
+        桥底净空 − 名义潮位 − 误差 >= 水面以上高度 + 安全余量
 
 择优：最早抵达；同一抵达时刻按航段编号序列字典序（小者优先）。
 算法：窗口 <= 1440 分钟，按时间展开 DP，每个 (节点, 分钟) 只保留字典序
@@ -44,30 +47,37 @@ def _load_segments(conn) -> dict[int, Segment]:
     }
 
 
-def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, float]:
-    """返回修订 revision 在 [lo, hi] 闭区间内的 {minute: level}。"""
+def _load_tide(conn, revision: int, lo: int, hi: int) -> dict[int, tuple[float, float]]:
+    """返回修订 revision 在 [lo, hi] 闭区间内的 {minute: (名义潮位, 误差)}。"""
     rows = conn.execute(
-        "SELECT minute, level FROM tide_values"
+        "SELECT minute, level, error FROM tide_values"
         " WHERE revision = ? AND minute BETWEEN ? AND ?",
         (revision, lo, hi),
     ).fetchall()
-    return {r["minute"]: r["level"] for r in rows}
+    return {r["minute"]: (r["level"], r["error"]) for r in rows}
 
 
-def _minute_ok(seg: Segment, tide: float, draft: float, height: float, margin: float) -> bool:
-    """航段在某一分钟是否满足深度/净空约束。"""
+def _minute_ok(
+    seg: Segment,
+    tide: float,
+    error: float,
+    draft: float,
+    height: float,
+    margin: float,
+) -> bool:
+    """航段在某一分钟是否满足深度/净空约束（按逐分钟误差带极值核验）。"""
     eps = config.EPS
-    if seg.depth + tide + eps < draft + margin:
+    if seg.depth + tide - error + eps < draft + margin:
         return False
     if seg.clearance is not None:
-        if seg.clearance - tide + eps < height + margin:
+        if seg.clearance - tide - error + eps < height + margin:
             return False
     return True
 
 
 def _build_departure_feasible(
     segs: list[Segment],
-    tide: dict[int, float],
+    tide: dict[int, tuple[float, float]],
     start: int,
     window: int,
     draft: float,
@@ -86,8 +96,8 @@ def _build_departure_feasible(
         bad = [0] * window
         for i in range(window):
             m = start + i
-            level = tide.get(m)
-            if level is None or not _minute_ok(seg, level, draft, height, margin):
+            tv = tide.get(m)
+            if tv is None or not _minute_ok(seg, tv[0], tv[1], draft, height, margin):
                 bad[i] = 1
         pref = [0] * (window + 1)
         for i in range(window):

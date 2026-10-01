@@ -29,6 +29,21 @@ def tide_missing(missing_minutes) -> ApiError:
     )
 
 
+def tide_missing_error_target(missing_minutes, base_revision: int) -> ApiError:
+    """误差修订的目标分钟在所据修订缺少名义潮位。"""
+    missing = sorted(int(m) for m in missing_minutes)
+    return ApiError(
+        422,
+        "MISSING_TIDE_DATA",
+        f"误差修订目标分钟中有 {len(missing)} 个在基础修订 #{base_revision} 缺少名义潮位",
+        {
+            "base_revision": base_revision,
+            "missing_minutes": missing[:20],
+            "total_missing": len(missing),
+        },
+    )
+
+
 def trip_not_found(trip_id: int) -> ApiError:
     return ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
                     {"trip_id": trip_id})

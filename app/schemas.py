@@ -41,10 +41,21 @@ class SegmentOut(BaseModel):
 
 class TideCorrection(BaseModel):
     corrections: dict[int, float] = Field(
-        description="要覆盖的 {分钟: 潮位(米)}；其余分钟继承所据修订"
+        description="要覆盖的 {分钟: 名义潮位(米)}；其余分钟名义潮位与误差均继承所据修订"
     )
     base_revision: Optional[int] = Field(
         default=None, description="所基于的修订号；不填则取最新修订"
+    )
+    note: Optional[str] = None
+
+
+class TideErrorRevisionIn(BaseModel):
+    errors: dict[int, float] = Field(
+        description="逐分钟误差修订 {分钟: 非负误差(米)}；未列出的分钟继承所据修订误差，"
+                    "名义潮位保持不变"
+    )
+    base_revision: Optional[int] = Field(
+        default=None, description="所基于的修订号（指定或省略取最新）；不填则取最新修订"
     )
     note: Optional[str] = None
 
@@ -128,6 +139,9 @@ class ViolationOut(BaseModel):
         description="违规原因：depth=水深不足，clearance=桥高净空不足，missing_tide=缺潮位"
     )
     tide_level: Optional[float] = None
+    tide_error: Optional[float] = Field(
+        default=None, description="目标修订该分钟的逐分钟预测误差（米），缺潮位时为 null"
+    )
     depth: float = Field(description="航段静水深度（米）")
     clearance: Optional[float] = Field(default=None, description="桥底净空（米），无桥为 null")
     required_depth: float = Field(description="要求的最小可用水深：吃水+余量（米）")
